@@ -1,0 +1,24 @@
+* gdisco-el
+Nascent emacs lisp bindings for Google's various APIs (using the Discovery API)
+* Motivation
+- Learning Emacs LISP
+- Provide a mechanism for interfacing with some interesting Google Services
+  - GMail
+  - Google Drive
+  - Google Sheets
+- Provide just enough functioanlity to be useful learning other Emacs features and LISP techniques in general
+* Limitations
+- Really just a dynamic porcelain on top of the published Google APIs
+  - Completely unoptimised
+  - Missing lots of functionality, batch calls and anything using these methods:
+    - DELETE
+    - POST
+    - PATCH
+    - PUT
+- Written by somebody who has never written any LISP before!
+- No checking:
+  - no parameter checking
+  - no checking results
+  - no error handling
+- No mapping results to declared schema objects
+- API likely to be unstable
