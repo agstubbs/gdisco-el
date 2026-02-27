@@ -1,0 +1,294 @@
+* gdisco-el: Review of Approach, Bindings Suitability, and Implementation Plan
+
+** 1. README Assessment
+
+The current README.org is minimal — two short sections (Motivation and Limitations)
+totalling ~25 lines. It honestly declares the project's experimental status and the
+author's learning context, which is commendable. However, it lacks:
+
+- Installation instructions
+- Usage examples (these exist in =example.el= but aren't referenced)
+- A dependency list (=json=, =oauth2=, =s= are required)
+- API documentation or function reference
+- A roadmap or contribution guide
+
+The self-identified limitations are accurate and well-prioritized:
+missing HTTP verbs (POST/PUT/PATCH/DELETE), no parameter validation,
+no error handling, no result-to-schema mapping, and instability caveats.
+
+** 2. Appraisal of Approach
+
+*** 2.1 Architecture: Discovery-Driven Dynamic Bindings
+
+The core design choice — fetching API specifications at runtime from Google's
+Discovery API and dynamically constructing requests — is *architecturally sound*
+and arguably the only reasonable approach for a small project aiming to cover
+multiple Google APIs. The alternative (hand-coding endpoint wrappers for each
+API) would be impractical given the breadth of Google's API surface.
+
+*Strengths:*
+- *Self-describing:* API metadata (parameters, paths, base URLs) comes directly
+  from Google, so the bindings automatically reflect the current API contract.
+- *Uniform interface:* A single =gdisco-do-get= function can call any GET
+  endpoint across any Google API. This is elegant and scales well.
+- *Explorability:* Users can inspect API structure programmatically via
+  =gdisco-describe-method-parameters=, which aligns with Emacs' philosophy of
+  introspection.
+
+*Weaknesses:*
+- *Synchronous HTTP:* =url-retrieve-synchronously= blocks Emacs entirely during
+  network calls. For a library that will make multiple API calls (e.g. paginated
+  results), this will freeze the editor.
+- *No caching:* Each =gdisco-get-api= call re-fetches the full Discovery document
+  (~100–500 KB of JSON). Discovery specs change rarely; caching them per-session
+  or on disk would be a significant improvement.
+- *No namespace isolation:* =example.el= uses =setq= to create global variables
+  (=gmail-api=, =gmail-token=). A proper token/API store is needed.
+- *Buffer manipulation:* Direct =(set-buffer)= / =(goto-char)= calls rather than
+  =with-current-buffer= or =save-excursion= patterns risk corrupting the user's
+  current buffer state if errors occur mid-execution.
+
+*** 2.2 Suitability of Target API Bindings
+
+The README identifies three target APIs: Gmail, Google Drive, and Google Sheets.
+
+| API           | Suitability for Emacs | GET-only viability | Complexity |
+|---------------+-----------------------+--------------------+------------|
+| Gmail         | High                  | Low                | Medium     |
+| Google Drive  | High                  | Medium             | Medium     |
+| Google Sheets | Very High             | Low                | High       |
+
+- *Gmail:* Excellent fit for Emacs (org-mode integration, mail workflows).
+  However, GET-only limits the library to read-only operations — sending mail,
+  modifying labels, and marking-as-read all require POST/PATCH. Read-only Gmail
+  is useful but has a low ceiling.
+
+- *Google Drive:* Good fit for Emacs file management workflows. Listing and
+  downloading files works with GET alone, making it the most immediately useful
+  binding with the current GET-only constraint. File upload requires POST with
+  multipart bodies, which is a more complex undertaking.
+
+- *Google Sheets:* Arguably the *best* fit for Emacs due to natural synergy with
+  org-mode tables. However, reading sheet data requires careful handling of
+  ranges, and writing data (the most powerful use case) needs POST/PUT. The
+  Discovery spec for Sheets is also one of the more complex ones.
+
+*Verdict:* The choice of target APIs is well-suited for Emacs workflows.
+The priority order should be adjusted to favour Drive (most GET-useful) first,
+then Gmail (broad appeal), then Sheets (highest value but needs POST).
+
+*** 2.3 Suitability of Emacs Lisp Constructs
+
+The current code uses several patterns worth commenting on:
+
+- *Plist parameters* (=:userId "me"=): Good idiomatic choice for keyword arguments.
+  However, mixing plists with alists (which is what the Discovery JSON decodes to)
+  creates friction — the conversion between =:keyword= symbols and string/symbol
+  parameter names in =gdisco-get-method-arguments-for-path-or-query= is fragile.
+
+- *Recursive list traversal:* Functions like =gdisco-get-path-to-method-node= use
+  manual recursion. This is fine for learning but could be simplified with
+  =cl-lib= functions (=cl-reduce=, =cl-mapcar=) or =seq.el= for clarity.
+
+- *Dependency on =s.el=:* Only used for =s-replace= and =s-format=. Could be
+  replaced with built-in =replace-regexp-in-string= and =format-spec= to reduce
+  dependencies, though =s.el= is idiomatic in modern Emacs Lisp.
+
+** 3. Phased Implementation Plan
+
+*** Phase 0: Foundation & Hygiene (prerequisite for all other phases)
+
+Goals: Make the code robust enough to build on.
+
+1. *Add package metadata:*
+   - Add =Package-Requires= header (Emacs version, =oauth2=, =s=)
+   - Add =Version= header
+   - Add proper =;;; Code:= / =;;; gdisco.el ends here= delimiters
+   - Define a =defgroup gdisco= customization group
+
+2. *Introduce defcustom variables:*
+   - =gdisco-cache-directory= — where to cache Discovery specs
+   - =gdisco-default-scopes= — alist of API-name → default OAuth scopes
+
+3. *Fix buffer safety:*
+   - Replace =(save-current-buffer (set-buffer ...))= with =(with-current-buffer ...)=
+   - Wrap network operations in =unwind-protect= for error safety
+
+4. *Add Discovery spec caching:*
+   - Cache to an in-memory hash table per session
+   - Optional file-based cache with TTL (Discovery specs are very stable)
+
+5. *Improve =example.el=:*
+   - Remove =setq= globals; use =let= bindings or a proper store
+   - Add inline commentary explaining each step
+
+Estimated scope: ~200 lines changed/added.
+
+*** Phase 1: Interactive Commands & User-Facing Features
+
+Goals: Make the library usable interactively from Emacs, not just programmatically.
+
+1. *Define a =gdisco-mode= minor mode:*
+   - Provides a keymap prefix (e.g. =C-c g=) for gdisco commands
+   - Mode-line lighter to indicate active API connections
+
+2. *Interactive API explorer:*
+   - =gdisco-list-apis=: Fetch and display available Google APIs in a buffer
+     with completion (uses Discovery directory endpoint)
+   - =gdisco-describe-api=: Show methods/resources for a chosen API in an
+     org-mode or outline-mode buffer
+   - =gdisco-describe-method=: Show parameters for a specific method with
+     =completing-read= for dot-notation method names
+
+3. *Interactive GET execution:*
+   - =gdisco-execute-get=: Prompt for API, method, and parameters; display
+     result in a dedicated =*gdisco-result*= buffer with JSON pretty-printing
+   - Support =completing-read= for parameter names drawn from the Discovery spec
+   - Use =json-pretty-print-buffer= or =json-mode= for result display
+
+4. *Token management:*
+   - =gdisco-authenticate=: Interactive command to initiate OAuth flow
+   - Store tokens in an alist keyed by (api . scopes)
+   - =gdisco-token-status=: Show current token state
+
+Estimated scope: ~400–500 lines added.
+
+*** Phase 2: Additional HTTP Methods
+
+Goals: Move beyond GET-only to support the full lifecycle of API interactions.
+
+1. *Implement =gdisco-do-request= (generic):*
+   - Refactor =gdisco-do-get= into a generic request function
+   - Accept an HTTP method parameter (=GET=, =POST=, =PUT=, =PATCH=, =DELETE=)
+   - Handle request bodies (JSON encoding of Emacs Lisp alists)
+   - Set appropriate =Content-Type= headers
+
+2. *Per-verb convenience functions:*
+   - =gdisco-do-post=, =gdisco-do-put=, =gdisco-do-patch=, =gdisco-do-delete=
+   - Each wraps =gdisco-do-request= with verb-specific defaults
+
+3. *Request body construction:*
+   - Introspect the Discovery spec's =request= property for the method's schema
+   - Provide a =gdisco-build-request-body= helper that prompts for required
+     fields based on the schema
+
+4. *Multipart upload support (for Drive):*
+   - Implement =multipart/related= body construction
+   - Media upload with resumable upload protocol (for large files)
+
+Estimated scope: ~300–400 lines added.
+
+*** Phase 3: Result Handling & Validation
+
+Goals: Make responses useful and inputs reliable.
+
+1. *Parameter validation:*
+   - Before making a request, validate supplied parameters against the Discovery
+     spec (check =required= fields, =type= constraints, =enum= values)
+   - Provide clear error messages for missing/invalid parameters
+
+2. *Result schema mapping:*
+   - Parse Discovery spec =schemas= section
+   - Provide typed accessors: =gdisco-get-field= that navigates nested JSON
+     results with dot-notation paths
+   - Optional: define =cl-defstruct= types for commonly used response objects
+
+3. *Pagination support:*
+   - Detect =nextPageToken= in responses
+   - =gdisco-do-get-all=: Automatically paginate and aggregate results
+   - =gdisco-do-get-stream=: Yield results page-by-page via callbacks
+
+4. *Error handling:*
+   - Parse Google API error responses (JSON with =error.code=, =error.message=)
+   - Define a =gdisco-api-error= condition with structured data
+   - Surface errors clearly in interactive buffers and programmatic callers
+
+Estimated scope: ~400–500 lines added.
+
+*** Phase 4: Async Operations & Performance
+
+Goals: Stop freezing Emacs during network operations.
+
+1. *Async HTTP:*
+   - Replace =url-retrieve-synchronously= with =url-retrieve= (callback-based)
+   - Or adopt =request.el= / =plz.el= for a cleaner async interface
+   - All =gdisco-do-*= functions gain a =:callback= keyword parameter
+
+2. *Progress reporting:*
+   - Use =make-progress-reporter= for long operations
+   - Display status in the echo area or mode line
+
+3. *Batch requests:*
+   - Implement Google's batch request protocol (multipart/mixed to
+     =https://www.googleapis.com/batch=)
+   - =gdisco-batch=: Macro/function that groups multiple API calls into one
+     HTTP round-trip
+
+4. *Connection pooling & keep-alive:*
+   - Reuse TCP connections across requests where =url.el= supports it
+
+Estimated scope: ~300–400 lines added.
+
+*** Phase 5: Domain-Specific Integrations
+
+Goals: Build higher-level Emacs features on top of the generic bindings.
+
+1. *Google Drive integration (=gdisco-drive.el=):*
+   - =gdisco-drive-list=: Browse Drive files in a =dired=-like buffer
+   - =gdisco-drive-download=: Download file to local filesystem
+   - =gdisco-drive-upload=: Upload current buffer or file (needs Phase 2)
+   - =gdisco-drive-find-file=: =find-file= analogue that opens Drive files
+
+2. *Gmail integration (=gdisco-gmail.el=):*
+   - =gdisco-gmail-inbox=: Display inbox summary in an org-mode buffer
+   - =gdisco-gmail-read=: Render a single message (parse MIME)
+   - =gdisco-gmail-search=: Interactive Gmail search with =completing-read=
+   - Future (post Phase 2): send, label, archive commands
+
+3. *Google Sheets integration (=gdisco-sheets.el=):*
+   - =gdisco-sheets-to-org-table=: Pull a sheet range into an org-mode table
+   - =gdisco-org-table-to-sheets=: Push an org-mode table to a sheet (Phase 2)
+   - =gdisco-sheets-browse=: Navigate spreadsheets/worksheets interactively
+
+Estimated scope: ~500–800 lines per integration.
+
+** 4. Recommended Priority and Dependencies
+
+#+BEGIN_SRC
+Phase 0 ─── Foundation
+   │
+   ├──► Phase 1 ─── Interactive Commands
+   │        │
+   │        └──► Phase 5a ─── Drive (read-only)
+   │
+   ├──► Phase 2 ─── HTTP Methods
+   │        │
+   │        ├──► Phase 3 ─── Validation & Results
+   │        │        │
+   │        │        └──► Phase 5b ─── Gmail (full)
+   │        │             Phase 5c ─── Sheets (full)
+   │        │
+   │        └──► Phase 4 ─── Async & Performance
+   │
+#+END_SRC
+
+Phase 0 is a hard prerequisite. After that, Phase 1 and Phase 2 can proceed
+in parallel. Phase 3 depends on Phase 2 (validation of request bodies). Phase 4
+is independent but benefits from a stable API surface (post Phase 2). Phase 5
+domain integrations can begin in read-only form after Phase 1, but full
+read-write versions require Phase 2+3.
+
+** 5. Summary
+
+The gdisco-el project takes a sound architectural approach: leveraging Google's
+Discovery API for dynamic, self-describing bindings rather than hand-coded
+endpoint wrappers. The target APIs (Gmail, Drive, Sheets) are well-chosen for
+Emacs integration. The main risks are the current synchronous-only design and
+lack of error handling, both of which are addressable. The library's greatest
+asset is its introspective nature — the ability to programmatically explore any
+Google API from within Emacs is uniquely powerful and worth building on.
+
+The phased plan above moves from stabilisation (Phase 0) through interactive
+usability (Phase 1), full HTTP coverage (Phase 2), robustness (Phase 3),
+performance (Phase 4), and finally domain-specific integrations (Phase 5),
+with each phase delivering standalone value.
