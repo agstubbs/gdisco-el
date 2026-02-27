@@ -10,25 +10,49 @@ The Clojure aws-api is the gold standard for descriptor-driven API bindings.
 Its entire public surface is *three functions*:
 
 #+BEGIN_SRC clojure
-;; 1. Create a client (loads service descriptor)
+;; 1. Create a client (loads service descriptor — not generated code)
 (def s3 (aws/client {:api :s3}))
+(def s3 (aws/client {:api :s3 :region "us-east-1"}))
 
 ;; 2. Invoke an operation (data in → data out)
 (aws/invoke s3 {:op :ListBuckets})
 (aws/invoke s3 {:op :GetObject
                 :request {:Bucket "my-bucket" :Key "my-key"}})
+(aws/invoke s3 {:op :PutObject
+                :request {:Bucket "my-bucket"
+                          :Key    "hello.txt"
+                          :Body   (.getBytes "Oh hai!")}})
 
-;; 3. Introspect
-(aws/doc s3 :GetObject)   ; → shows parameters, docs
-(aws/ops s3)              ; → lists all operations
+;; 3. Introspect (REPL-driven discovery)
+(aws/doc s3 :GetObject)   ; → prints parameters, types, docs
+(aws/ops s3)              ; → all operations as data
+(-> (aws/ops s3) keys sort) ; → sorted operation names
 #+END_SRC
 
 Key design principles:
 - *Data-oriented:* Maps in, maps out. No wrapper objects, no generated classes.
 - *Uniform:* Every AWS service, every operation, same three functions.
-- *Descriptor-driven:* Service specs are data files, not codegen artifacts.
-- *Errors as data:* Failures return maps with =:cognitect.anomalies/category=.
+- *Descriptor-driven:* Service specs are data files loaded at runtime, not codegen.
+  When you call =client=, the library loads the descriptor and uses it to
+  mechanically transform between Clojure maps and the wire format.
+- *Errors as data:* Failures return maps with =:cognitect.anomalies/category=
+  (not exceptions). Categories include =:not-found=, =:forbidden=, =:busy=,
+  =:unavailable=, =:incorrect=, =:fault=. Retryable categories (=:busy=,
+  =:unavailable=) get automatic retry with exponential backoff.
 - *No code generation:* The API surface never changes regardless of service.
+- *Async via channel:* =(aws/invoke-async s3 {:op :ListBuckets})= returns a
+  =core.async= channel. Same op-map shape, different return type.
+
+The runtime API can be captured in this mental model:
+
+#+BEGIN_EXAMPLE
+     client {:api :s3}  →  client object
+     invoke client {:op :X :request {...}}  →  result map (or anomaly map)
+#+END_EXAMPLE
+
+Everything else — credentials, regions, serialisation, signing, retries,
+error coercion — is handled by the engine interpreting service descriptors.
+The user never sees any of it.
 
 ** Reference: Emacs Lisp Precedents
 
@@ -41,24 +65,36 @@ Key design principles:
 
 ;; Pagination built in
 (ghub-get "/repos/:owner/:repo/commits" params
-          :pages 5)
+          :unpaginate t)  ; follows all pages, returns combined result
 #+END_SRC
 
 Pattern: one function per HTTP verb, URL templates, alist parameters.
+Auth uses Emacs's =auth-source= library with per-package token scoping.
+Sync by default; `:callback` keyword switches to async.
 
 *** plz.el (modern HTTP)
 #+BEGIN_SRC emacs-lisp
-;; Synchronous
-(plz 'get "https://example.com/api" :as 'json)
+;; Synchronous (default — just returns the data)
+(plz 'get "https://example.com/api" :as #'json-read)
 
-;; Async with callback
-(plz 'get url :as 'json
-     :then (lambda (data) (message "%S" data)))
+;; Async — same function, add :then
+(plz 'get url :as #'json-read
+     :then (lambda (data) (message "%S" data))
+     :else (lambda (err) (message "Error: %S" err)))
 
-;; Sync and async share the same API shape
+;; Errors: condition-case for sync, :else for async
+(condition-case err
+    (plz 'get "https://example.com/404")
+  (plz-http-error (message "HTTP error: %S" err)))
 #+END_SRC
 
-Pattern: single entry point, verb as first arg, keyword params, sync/async unified.
+Pattern: single entry point, verb as first arg, sync-by-default,
+=:then= presence toggles async. Structured error hierarchy via
+=define-error= (=plz-error= / =plz-curl-error= / =plz-http-error=).
+Has =plz-queue= for concurrency control.
+
+*plz.el's sync-by-default with =:then= for async is the most ergonomic
+modern Emacs pattern.* Simple calls are simple; complexity is opt-in.
 
 *** request.el
 #+BEGIN_SRC emacs-lisp
@@ -71,7 +107,35 @@ Pattern: single entry point, verb as first arg, keyword params, sync/async unifi
               (message "Got: %S" data))))
 #+END_SRC
 
-Pattern: URL-centric, callback-heavy, many keyword parameters.
+Pattern: URL-centric, async-by-default, callback-heavy, jQuery-inspired.
+The =:parser= function runs in the response buffer then feeds callbacks.
+Supports =:sync t= but it's not the default path.
+
+*** org-gcal.el (Google Calendar)
+#+BEGIN_SRC emacs-lisp
+;; User-facing: interactive commands, not a programmatic API
+(org-gcal-sync)
+(org-gcal-fetch)
+(org-gcal-post-at-point)
+
+;; Auth: OAuth2 via oauth2-auto, tokens stored in plstore (encrypted)
+(setq org-gcal-client-id "ID.apps.googleusercontent.com"
+      org-gcal-client-secret "SECRET")
+#+END_SRC
+
+Pattern: side-effect-oriented (results appear as org buffer changes).
+Uses =deferred.el= promise chains + =request-deferred= + =aio= for OAuth.
+Auto-retries on 401 after token refresh. Three async layers add complexity.
+
+*** Comparative summary of Emacs patterns
+
+| Aspect          | ghub.el      | plz.el           | request.el       | org-gcal      |
+|-----------------+--------------+------------------+------------------+---------------|
+| Default mode    | Sync         | *Sync*           | Async            | Async         |
+| Async mechanism | =:callback=  | =:then= function | =:success= cb    | =deferred.el= |
+| Auth            | =auth-source=| Manual headers   | curl's auth      | OAuth2        |
+| Error pattern   | Signal       | =condition-case= | =:error= callback| Auto-retry    |
+| Pagination      | =:unpaginate=| Manual           | Manual           | Manual        |
 
 ** Candidate Designs for gdisco-el
 
@@ -411,3 +475,168 @@ API parameters come from Google's Discovery spec (e.g. =:userId=, =:format=,
 - =:gdisco-signal= — signal conditions on error
 - =:then= / =:else= — async callbacks (short enough to be unambiguous)
 - =:body= — request body (no Google API uses "body" as a parameter name)
+
+** Key Design Decisions to Agree Before Implementation
+
+These are the open questions whose answers lock in the binding shape.
+
+*** 1. Error model: errors-as-data vs condition signals
+
+The aws-api returns anomaly maps. plz.el signals structured conditions.
+Emacs users expect =condition-case=. The recommendation is:
+
+- *Sync calls:* return error alists by default (aws-api style), signal
+  =gdisco-api-error= when =:gdisco-signal t= is passed
+- *Async calls:* route errors to =:else= callback (plz.el style)
+- *Predicate:* =(gdisco-error-p result)= tests any return value
+- *Accessors:* =(gdisco-error-code result)=, =(gdisco-error-message result)=
+
+The error alist mirrors Google's standard error response:
+#+BEGIN_SRC emacs-lisp
+'((gdisco-error . t)
+  (code . 404)
+  (message . "Requested entity was not found.")
+  (status . "NOT_FOUND")
+  (errors . [((message . "...") (domain . "global") (reason . "notFound"))]))
+#+END_SRC
+
+*Alternative:* always signal conditions (like plz.el). Simpler, more Emacsy,
+but makes functional composition harder (every caller needs =condition-case=).
+
+*** 2. Sync-first vs async-first
+
+Following plz.el's lead: *sync by default, async opt-in via =:then=*.
+
+This is critical for REPL/scratch-buffer exploration — the most common
+early use case. =(gdisco-invoke gmail "users.messages.list" :userId "me")=
+should just return data, not require a callback.
+
+Async becomes essential for interactive commands (Phase 1+) and will use
+the same =:then= / =:else= pattern as plz.el.
+
+*** 3. Client object representation
+
+Options:
+- *Plist:* ='(:api-name "gmail" :version "v1" :token ... :spec ...)=
+  Simple, transparent, but no type safety.
+- *cl-defstruct:* =(cl-defstruct gdisco-client api-name version token spec base-url)=
+  Type-safe, has =gdisco-client-p= predicate, but heavier.
+- *Opaque symbol with properties:* Store state in symbol properties.
+  Unusual, not recommended.
+
+Recommendation: =cl-defstruct=. It's lightweight, gives you a predicate for
+free, and accessors are explicit. The client is the one object users hold
+onto — it should be identifiable.
+
+#+BEGIN_SRC emacs-lisp
+(cl-defstruct gdisco-client
+  api-name version token spec base-url)
+
+;; Usage:
+(gdisco-client-p gmail)           ; → t
+(gdisco-client-api-name gmail)    ; → "gmail"
+#+END_SRC
+
+*** 4. Discovery spec caching
+
+Options:
+- *In-memory hash table:* Cache per (api-name . version) key. Lost on restart.
+- *File-based:* Serialize to =~/.emacs.d/gdisco/cache/gmail-v1.json=.
+  Survives restarts. TTL-based invalidation (specs change ~monthly).
+- *Both:* Memory cache with file-based fallback.
+
+Recommendation: Both. File cache with 7-day TTL, memory cache per session.
+=gdisco-client= checks memory → file → network, in that order.
+
+*** 5. HTTP transport layer
+
+Options:
+- *url.el (built-in):* No external deps. Sync via =url-retrieve-synchronously=,
+  async via =url-retrieve=. What the project currently uses.
+- *plz.el:* Modern, clean, sync-by-default. Requires curl. Would need to be
+  a dependency.
+- *request.el:* Widely used, backend-flexible. Async-first design clashes
+  with our sync-first preference.
+
+Recommendation: Start with =url.el= (zero deps, already in use). Abstract
+the transport behind =gdisco--request-sync= / =gdisco--request-async= so
+plz.el can be swapped in later as an optional backend.
+
+*** 6. Auth-source integration
+
+ghub.el's per-package =auth-source= integration is the gold standard for
+Emacs credential management. For Google OAuth2, the flow is different
+(browser-based consent + refresh tokens), but the storage should still
+use =auth-source= or =plstore= (encrypted).
+
+Recommendation: =gdisco-auth= wraps =oauth2-auth-and-store= (already a
+dependency) but provides a higher-level interface that reads client
+credentials from =auth-source= by default. Tokens persist across sessions
+via =oauth2.el='s built-in plstore mechanism.
+
+*** 7. What =gdisco-doc= returns and displays
+
+Two modes:
+- *Programmatic:* return an alist (for code that inspects parameters)
+- *Interactive:* display a formatted help buffer (for humans at the REPL)
+
+Recommendation: When called interactively (=M-x gdisco-doc=), pop a
+=*gdisco-doc*= buffer with formatted output. When called from code,
+return the raw alist. Use =(called-interactively-p 'any)= to distinguish.
+
+#+BEGIN_SRC emacs-lisp
+;; Programmatic:
+(gdisco-doc gmail "users.messages.get")
+;; → alist with parameters, description, httpMethod
+
+;; Interactive (M-x or in scratch buffer with C-j):
+;; Pops a nicely formatted buffer showing:
+;;
+;;   users.messages.get                                    [GET]
+;;   Gets the specified message.
+;;
+;;   REQUIRED:
+;;     userId  string  "The user's email address."
+;;     id      string  "The ID of the message to retrieve."
+;;
+;;   OPTIONAL:
+;;     format  string  enum: full, metadata, minimal, raw
+;;     metadataHeaders  string (repeated)
+#+END_SRC
+
+** Phased Implementation Plan (revised for Design D)
+
+*** Phase 0: Core Plumbing
+- =cl-defstruct gdisco-client=
+- =gdisco-client= constructor (fetch + cache Discovery spec)
+- =gdisco--request-sync= / =gdisco--request-async= transport abstraction
+- =gdisco--resolve-method= (operation name → method node in spec)
+- =gdisco--build-url= (parameter injection into path template + query string)
+- =gdisco--extract-control-params= / =gdisco--extract-api-params=
+- Refactor existing =gdisco-do-get= internals into the new structure
+- File-based Discovery spec cache
+
+*** Phase 1: The Five Public Functions
+- =gdisco-auth= — high-level OAuth wrapper
+- =gdisco-client= — public constructor
+- =gdisco-invoke= — the core function (GET only at first, then all verbs)
+- =gdisco-ops= — enumerate operations from the spec
+- =gdisco-doc= — describe operations (programmatic + interactive)
+- Error model: =gdisco-error-p=, =gdisco-error-code=, =gdisco-error-message=
+
+*** Phase 2: Full HTTP Verb Support
+- Extend =gdisco-invoke= to handle POST/PUT/PATCH/DELETE
+- JSON request body encoding
+- =:body= parameter handling
+- =Content-Type= header management
+
+*** Phase 3: Robustness
+- Parameter validation against spec (required fields, types, enums)
+- Auto-pagination via =:gdisco-pages=
+- =:gdisco-signal= condition signalling mode
+- Async support via =:then= / =:else=
+
+*** Phase 4: Domain Integrations
+- =gdisco-drive.el= — file browsing / download
+- =gdisco-gmail.el= — inbox / message reading
+- =gdisco-sheets.el= — org-table ↔ sheet sync
