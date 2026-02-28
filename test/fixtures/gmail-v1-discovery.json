@@ -1,0 +1,202 @@
+{
+  "kind": "discovery#restDescription",
+  "discoveryVersion": "v1",
+  "id": "gmail:v1",
+  "name": "gmail",
+  "version": "v1",
+  "title": "Gmail API",
+  "description": "The Gmail API lets you view and manage Gmail mailbox data.",
+  "protocol": "rest",
+  "baseUrl": "https://gmail.googleapis.com/gmail/v1/",
+  "basePath": "/gmail/v1/",
+  "rootUrl": "https://gmail.googleapis.com/",
+  "servicePath": "gmail/v1/",
+  "parameters": {
+    "alt": {
+      "type": "string",
+      "description": "Data format for the response.",
+      "default": "json",
+      "enum": ["json"],
+      "location": "query"
+    },
+    "fields": {
+      "type": "string",
+      "description": "Selector specifying which fields to include.",
+      "location": "query"
+    },
+    "key": {
+      "type": "string",
+      "description": "API key.",
+      "location": "query"
+    },
+    "prettyPrint": {
+      "type": "boolean",
+      "description": "Returns response with indentations and line breaks.",
+      "default": "true",
+      "location": "query"
+    }
+  },
+  "resources": {
+    "users": {
+      "methods": {
+        "getProfile": {
+          "id": "gmail.users.getProfile",
+          "path": "users/{userId}/profile",
+          "httpMethod": "GET",
+          "description": "Gets the current user's Gmail profile.",
+          "parameters": {
+            "userId": {
+              "type": "string",
+              "description": "The user's email address. The special value \"me\" can be used.",
+              "required": true,
+              "default": "me",
+              "location": "path"
+            }
+          },
+          "parameterOrder": ["userId"]
+        }
+      },
+      "resources": {
+        "messages": {
+          "methods": {
+            "list": {
+              "id": "gmail.users.messages.list",
+              "path": "users/{userId}/messages",
+              "httpMethod": "GET",
+              "description": "Lists the messages in the user's mailbox.",
+              "parameters": {
+                "userId": {
+                  "type": "string",
+                  "description": "The user's email address.",
+                  "required": true,
+                  "default": "me",
+                  "location": "path"
+                },
+                "maxResults": {
+                  "type": "integer",
+                  "description": "Maximum number of messages to return.",
+                  "default": "100",
+                  "format": "uint32",
+                  "location": "query"
+                },
+                "pageToken": {
+                  "type": "string",
+                  "description": "Page token to retrieve a specific page.",
+                  "location": "query"
+                },
+                "q": {
+                  "type": "string",
+                  "description": "Only return messages matching the specified query.",
+                  "location": "query"
+                },
+                "labelIds": {
+                  "type": "string",
+                  "description": "Only return messages with labels that match.",
+                  "repeated": true,
+                  "location": "query"
+                }
+              },
+              "parameterOrder": ["userId"]
+            },
+            "get": {
+              "id": "gmail.users.messages.get",
+              "path": "users/{userId}/messages/{id}",
+              "httpMethod": "GET",
+              "description": "Gets the specified message.",
+              "parameters": {
+                "userId": {
+                  "type": "string",
+                  "description": "The user's email address.",
+                  "required": true,
+                  "default": "me",
+                  "location": "path"
+                },
+                "id": {
+                  "type": "string",
+                  "description": "The ID of the message to retrieve.",
+                  "required": true,
+                  "location": "path"
+                },
+                "format": {
+                  "type": "string",
+                  "description": "The format to return the message in.",
+                  "default": "full",
+                  "enum": ["full", "metadata", "minimal", "raw"],
+                  "location": "query"
+                },
+                "metadataHeaders": {
+                  "type": "string",
+                  "description": "When given and format is METADATA, only include headers specified.",
+                  "repeated": true,
+                  "location": "query"
+                }
+              },
+              "parameterOrder": ["userId", "id"]
+            },
+            "send": {
+              "id": "gmail.users.messages.send",
+              "path": "users/{userId}/messages/send",
+              "httpMethod": "POST",
+              "description": "Sends the specified message to the recipients.",
+              "parameters": {
+                "userId": {
+                  "type": "string",
+                  "description": "The user's email address.",
+                  "required": true,
+                  "default": "me",
+                  "location": "path"
+                }
+              },
+              "parameterOrder": ["userId"],
+              "request": {
+                "$ref": "Message"
+              }
+            },
+            "delete": {
+              "id": "gmail.users.messages.delete",
+              "path": "users/{userId}/messages/{id}",
+              "httpMethod": "DELETE",
+              "description": "Immediately and permanently deletes the specified message.",
+              "parameters": {
+                "userId": {
+                  "type": "string",
+                  "description": "The user's email address.",
+                  "required": true,
+                  "default": "me",
+                  "location": "path"
+                },
+                "id": {
+                  "type": "string",
+                  "description": "The ID of the message to delete.",
+                  "required": true,
+                  "location": "path"
+                }
+              },
+              "parameterOrder": ["userId", "id"]
+            }
+          }
+        },
+        "labels": {
+          "methods": {
+            "list": {
+              "id": "gmail.users.labels.list",
+              "path": "users/{userId}/labels",
+              "httpMethod": "GET",
+              "description": "Lists all labels in the user's mailbox.",
+              "parameters": {
+                "userId": {
+                  "type": "string",
+                  "description": "The user's email address.",
+                  "required": true,
+                  "default": "me",
+                  "location": "path"
+                }
+              },
+              "parameterOrder": ["userId"]
+            }
+          }
+        }
+      }
+    }
+  }
+}
