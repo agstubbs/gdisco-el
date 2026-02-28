@@ -1,0 +1,813 @@
+* gdisco-el: Binding Design Proposals
+
+This document compares candidate API surface designs for gdisco-el,
+informed by the Clojure aws-api (Cognitect) and established Emacs Lisp
+API client patterns (ghub.el, plz.el, request.el).
+
+** Reference: How Cognitect's aws-api Works
+
+The Clojure aws-api is the gold standard for descriptor-driven API bindings.
+Its entire public surface is *three functions*:
+
+#+BEGIN_SRC clojure
+;; 1. Create a client (loads service descriptor — not generated code)
+(def s3 (aws/client {:api :s3}))
+(def s3 (aws/client {:api :s3 :region "us-east-1"}))
+
+;; 2. Invoke an operation (data in → data out)
+(aws/invoke s3 {:op :ListBuckets})
+(aws/invoke s3 {:op :GetObject
+                :request {:Bucket "my-bucket" :Key "my-key"}})
+(aws/invoke s3 {:op :PutObject
+                :request {:Bucket "my-bucket"
+                          :Key    "hello.txt"
+                          :Body   (.getBytes "Oh hai!")}})
+
+;; 3. Introspect (REPL-driven discovery)
+(aws/doc s3 :GetObject)   ; → prints parameters, types, docs
+(aws/ops s3)              ; → all operations as data
+(-> (aws/ops s3) keys sort) ; → sorted operation names
+#+END_SRC
+
+Key design principles:
+- *Data-oriented:* Maps in, maps out. No wrapper objects, no generated classes.
+- *Uniform:* Every AWS service, every operation, same three functions.
+- *Descriptor-driven:* Service specs are data files loaded at runtime, not codegen.
+  When you call =client=, the library loads the descriptor and uses it to
+  mechanically transform between Clojure maps and the wire format.
+- *Errors as data:* Failures return maps with =:cognitect.anomalies/category=
+  (not exceptions). Categories include =:not-found=, =:forbidden=, =:busy=,
+  =:unavailable=, =:incorrect=, =:fault=. Retryable categories (=:busy=,
+  =:unavailable=) get automatic retry with exponential backoff.
+- *No code generation:* The API surface never changes regardless of service.
+- *Async via channel:* =(aws/invoke-async s3 {:op :ListBuckets})= returns a
+  =core.async= channel. Same op-map shape, different return type.
+
+The runtime API can be captured in this mental model:
+
+#+BEGIN_EXAMPLE
+     client {:api :s3}  →  client object
+     invoke client {:op :X :request {...}}  →  result map (or anomaly map)
+#+END_EXAMPLE
+
+Everything else — credentials, regions, serialisation, signing, retries,
+error coercion — is handled by the engine interpreting service descriptors.
+The user never sees any of it.
+
+** Reference: Emacs Lisp Precedents
+
+*** ghub.el (GitHub API)
+#+BEGIN_SRC emacs-lisp
+;; Verb-based functions, URL templates
+(ghub-get "/repos/:owner/:repo" '((owner . "magit") (repo . "magit")))
+(ghub-post "/repos/:owner/:repo/issues" nil
+           :payload '((title . "Bug")))
+
+;; Pagination built in
+(ghub-get "/repos/:owner/:repo/commits" params
+          :unpaginate t)  ; follows all pages, returns combined result
+#+END_SRC
+
+Pattern: one function per HTTP verb, URL templates, alist parameters.
+Auth uses Emacs's =auth-source= library with per-package token scoping.
+Sync by default; `:callback` keyword switches to async.
+
+*** plz.el (modern HTTP)
+#+BEGIN_SRC emacs-lisp
+;; Synchronous (default — just returns the data)
+(plz 'get "https://example.com/api" :as #'json-read)
+
+;; Async — same function, add :then
+(plz 'get url :as #'json-read
+     :then (lambda (data) (message "%S" data))
+     :else (lambda (err) (message "Error: %S" err)))
+
+;; Errors: condition-case for sync, :else for async
+(condition-case err
+    (plz 'get "https://example.com/404")
+  (plz-http-error (message "HTTP error: %S" err)))
+#+END_SRC
+
+Pattern: single entry point, verb as first arg, sync-by-default,
+=:then= presence toggles async. Structured error hierarchy via
+=define-error= (=plz-error= / =plz-curl-error= / =plz-http-error=).
+Has =plz-queue= for concurrency control.
+
+*plz.el's sync-by-default with =:then= for async is the most ergonomic
+modern Emacs pattern.* Simple calls are simple; complexity is opt-in.
+
+*** request.el
+#+BEGIN_SRC emacs-lisp
+(request "https://api.example.com/resource"
+  :type "POST"
+  :data (json-encode '((key . "value")))
+  :parser 'json-read
+  :success (cl-function
+            (lambda (&key data &allow-other-keys)
+              (message "Got: %S" data))))
+#+END_SRC
+
+Pattern: URL-centric, async-by-default, callback-heavy, jQuery-inspired.
+The =:parser= function runs in the response buffer then feeds callbacks.
+Supports =:sync t= but it's not the default path.
+
+*** org-gcal.el (Google Calendar)
+#+BEGIN_SRC emacs-lisp
+;; User-facing: interactive commands, not a programmatic API
+(org-gcal-sync)
+(org-gcal-fetch)
+(org-gcal-post-at-point)
+
+;; Auth: OAuth2 via oauth2-auto, tokens stored in plstore (encrypted)
+(setq org-gcal-client-id "ID.apps.googleusercontent.com"
+      org-gcal-client-secret "SECRET")
+#+END_SRC
+
+Pattern: side-effect-oriented (results appear as org buffer changes).
+Uses =deferred.el= promise chains + =request-deferred= + =aio= for OAuth.
+Auto-retries on 401 after token refresh. Three async layers add complexity.
+
+*** Comparative summary of Emacs patterns
+
+| Aspect          | ghub.el      | plz.el           | request.el       | org-gcal      |
+|-----------------+--------------+------------------+------------------+---------------|
+| Default mode    | Sync         | *Sync*           | Async            | Async         |
+| Async mechanism | =:callback=  | =:then= function | =:success= cb    | =deferred.el= |
+| Auth            | =auth-source=| Manual headers   | curl's auth      | OAuth2        |
+| Error pattern   | Signal       | =condition-case= | =:error= callback| Auto-retry    |
+| Pagination      | =:unpaginate=| Manual           | Manual           | Manual        |
+
+** Candidate Designs for gdisco-el
+
+*** Design A: aws-api Direct Translation (Minimal Surface)
+
+Directly port the aws-api philosophy to Emacs Lisp.
+
+#+BEGIN_SRC emacs-lisp
+;;; Core surface: 3 functions + auth
+
+;; Authenticate (returns a token object)
+(setq my-token (gdisco-auth "~/.credentials/client.json"
+                            "https://www.googleapis.com/auth/gmail.readonly"))
+
+;; Create a client (fetches + caches Discovery spec)
+(setq gmail (gdisco-client "gmail" "v1" :token my-token))
+
+;; Invoke an operation
+(gdisco-invoke gmail
+  :op "users.messages.list"
+  :request '(:userId "me"))
+
+(gdisco-invoke gmail
+  :op "users.messages.get"
+  :request '(:userId "me" :id "abc123" :format "metadata"))
+
+;; Introspect
+(gdisco-doc gmail "users.messages.get")   ; → parameters, description
+(gdisco-ops gmail)                        ; → all operations
+(gdisco-ops gmail :filter "messages")     ; → filtered operations
+#+END_SRC
+
+*Strengths:*
+- Tiniest possible API surface — easy to learn, hard to misuse
+- Uniform: works identically for Gmail, Drive, Sheets, any Google API
+- =gdisco-invoke= handles GET/POST/PUT/PATCH/DELETE transparently
+  based on the Discovery spec's =httpMethod= field for each operation
+- The user never needs to know which HTTP verb an operation uses
+- Introspection is a first-class citizen
+
+*Weaknesses:*
+- Keyword =:op= + string method name is slightly verbose
+- Plist =:request= syntax requires quoting — easy to get wrong
+- Less "Emacsy" than verb-based patterns Emacs users expect
+- Single =gdisco-invoke= makes it hard to distinguish read vs write
+  operations at a glance
+
+*** Design B: Verb-Based (ghub-style)
+
+One function per HTTP verb, with method names as the primary argument.
+
+#+BEGIN_SRC emacs-lisp
+;; Setup
+(setq gmail (gdisco-client "gmail" "v1" :token my-token))
+
+;; Verb-based calls
+(gdisco-get gmail "users.messages.list" :userId "me")
+(gdisco-get gmail "users.messages.get" :userId "me" :id "abc123")
+(gdisco-post gmail "users.messages.send" :userId "me"
+             :body '((raw . "base64data...")))
+(gdisco-delete gmail "users.messages.delete" :userId "me" :id "abc123")
+
+;; Introspect
+(gdisco-doc gmail "users.messages.get")
+(gdisco-ops gmail)
+#+END_SRC
+
+*Strengths:*
+- Feels natural to Emacs users (mirrors ghub.el)
+- Inline keyword params — no nested =:request= plist
+- Verb is visible at the call site — clear read/write semantics
+- Flat argument list is simpler to construct programmatically
+
+*Weaknesses:*
+- Requires users to know which HTTP verb each operation uses
+  (the Discovery spec already declares this — why make the user repeat it?)
+- 5 functions instead of 1 for the same thing
+- If a user calls =gdisco-get= on a POST-only operation, what happens?
+  Must either error (annoying) or silently fix (surprising)
+
+*** Design C: Hybrid — Invoke + Convenience Verbs
+
+Combine the aws-api core with optional verb shortcuts.
+
+#+BEGIN_SRC emacs-lisp
+;; Primary: data-driven invoke (verb inferred from Discovery spec)
+(gdisco-invoke gmail
+  :op "users.messages.list"
+  :request '(:userId "me"))
+
+;; Convenience: explicit verb when you want control
+(gdisco-get gmail "users.messages.list" :userId "me")
+(gdisco-post gmail "users.messages.send" :userId "me"
+             :body '((raw . "...")))
+
+;; Same introspection
+(gdisco-doc gmail "users.messages.get")
+#+END_SRC
+
+*Strengths:*
+- Invoke for the common case (verb auto-detected)
+- Explicit verbs for edge cases or when clarity matters
+- Gradual learning: start with invoke, use verbs when needed
+
+*Weaknesses:*
+- Two ways to do the same thing — violates Emacs convention
+- Documentation overhead — must explain both paths
+- "Which should I use?" is an FAQ waiting to happen
+
+*** Design D: Data-Driven with Flat Params (Recommended)
+
+Takes the aws-api philosophy but adapts it to Emacs Lisp idioms:
+flat keyword arguments instead of nested maps, and leverages the
+Discovery spec fully so users never specify HTTP verbs.
+
+#+BEGIN_SRC emacs-lisp
+;;; ============================================================
+;;; Setup (once per session)
+;;; ============================================================
+
+;; Authenticate
+(setq my-token (gdisco-auth "~/.credentials/client.json"
+                            :scopes '("https://www.googleapis.com/auth/gmail.readonly")))
+
+;; Create a client — fetches and caches the Discovery spec
+(setq gmail (gdisco-client "gmail" "v1" :token my-token))
+
+
+;;; ============================================================
+;;; Invoke operations — flat keyword params
+;;; ============================================================
+
+;; List messages (Discovery spec says this is GET — user doesn't care)
+(gdisco-invoke gmail "users.messages.list"
+  :userId "me"
+  :maxResults 10)
+
+;; Get a specific message
+(gdisco-invoke gmail "users.messages.get"
+  :userId "me"
+  :id "abc123"
+  :format "metadata"
+  :metadataHeaders '("From" "Subject"))
+
+;; Send a message (Discovery spec says POST — handled automatically)
+(gdisco-invoke gmail "users.messages.send"
+  :userId "me"
+  :body '((raw . "base64encodedmessage...")))
+
+;; Delete a message (Discovery spec says DELETE)
+(gdisco-invoke gmail "users.messages.delete"
+  :userId "me"
+  :id "abc123")
+
+;; Drive: list files
+(setq drive (gdisco-client "drive" "v3" :token drive-token))
+(gdisco-invoke drive "files.list"
+  :q "mimeType='application/pdf'"
+  :pageSize 20)
+
+;; Sheets: read a range
+(setq sheets (gdisco-client "sheets" "v4" :token sheets-token))
+(gdisco-invoke sheets "spreadsheets.values.get"
+  :spreadsheetId "abc123"
+  :range "Sheet1!A1:D10")
+
+
+;;; ============================================================
+;;; Introspection — explore any API from within Emacs
+;;; ============================================================
+
+;; What operations are available?
+(gdisco-ops gmail)
+;; → ("users.getProfile" "users.messages.list" "users.messages.get"
+;;    "users.messages.send" "users.messages.delete" ...)
+
+;; Filtered
+(gdisco-ops gmail "messages")
+;; → ("users.messages.list" "users.messages.get" ...)
+
+;; Describe an operation (parameters, types, required, HTTP method)
+(gdisco-doc gmail "users.messages.get")
+;; → ((description . "Gets the specified message.")
+;;    (httpMethod . "GET")
+;;    (parameters
+;;     (userId (type . "string") (required . t) (description . "..."))
+;;     (id     (type . "string") (required . t) (description . "..."))
+;;     (format (type . "string") (enum . ("full" "metadata" "minimal" "raw")))))
+
+
+;;; ============================================================
+;;; Async variant — same shape, callback added
+;;; ============================================================
+
+(gdisco-invoke gmail "users.messages.list"
+  :userId "me"
+  :then (lambda (result) (message "Got %d messages" (length (alist-get 'messages result))))
+  :else (lambda (err) (message "Error: %s" (alist-get 'message err))))
+
+;; Without :then/:else → synchronous (returns data directly)
+;; With :then          → asynchronous (returns immediately, calls back)
+
+
+;;; ============================================================
+;;; Pagination — built-in
+;;; ============================================================
+
+;; Single page (default)
+(gdisco-invoke gmail "users.messages.list" :userId "me")
+
+;; All pages (auto-pagination)
+(gdisco-invoke gmail "users.messages.list"
+  :userId "me"
+  :gdisco-pages t)  ; namespaced to avoid collision with API params
+
+;; Limited pages
+(gdisco-invoke gmail "users.messages.list"
+  :userId "me"
+  :gdisco-pages 3)
+
+
+;;; ============================================================
+;;; Error handling
+;;; ============================================================
+
+;; Errors are returned as data, not signalled (like aws-api anomalies)
+(let ((result (gdisco-invoke gmail "users.messages.get"
+                :userId "me" :id "nonexistent")))
+  (if (gdisco-error-p result)
+      (message "Error %d: %s"
+               (gdisco-error-code result)
+               (gdisco-error-message result))
+    (process-message result)))
+
+;; Or use the :else callback for async error handling (shown above)
+
+;; For interactive use, errors can optionally signal conditions:
+(gdisco-invoke gmail "users.messages.get"
+  :userId "me" :id "nonexistent"
+  :gdisco-signal t)  ; signals 'gdisco-api-error on failure
+#+END_SRC
+
+*Strengths:*
+- Flattest possible call syntax — no nested plists to quote
+- =gdisco-invoke= is the only function you need to learn
+- HTTP verb is always auto-detected from Discovery spec
+- Sync/async is the same function, toggled by presence of =:then=
+- =:gdisco-*= namespace prefix cleanly separates library params from API params
+- Errors-as-data by default (functional), signals optional (interactive)
+- Introspection via =gdisco-ops= / =gdisco-doc= — explore APIs live
+
+*Weaknesses:*
+- Flat keyword params means =:body= is a special keyword for request bodies
+  (but this is clear and unambiguous since no Google API has a "body" path param)
+- =gdisco-*= namespaced keywords are slightly unusual for Emacs Lisp
+  (but necessary to avoid collision with arbitrary API parameter names)
+
+** Comparison Matrix
+
+| Criterion                     | A (aws-api) | B (verbs) | C (hybrid) | D (flat) |
+|-------------------------------+-------------+-----------+------------+----------|
+| API surface size              | Tiny (3)    | Medium(7) | Large (8)  | Tiny (4) |
+| Learning curve                | Low         | Low       | Medium     | Low      |
+| User must know HTTP verb?     | No          | Yes       | Sometimes  | No       |
+| Emacs idiom fit               | Medium      | High      | Medium     | High     |
+| Programmatic composability    | High        | High      | High       | Highest  |
+| Async story                   | Separate fn | Separate  | Separate   | Unified  |
+| Risk of misuse                | Low         | Medium    | Medium     | Low      |
+| Call-site readability         | Good        | Good      | Confusing  | Best     |
+
+** Recommendation
+
+*Design D (Data-Driven with Flat Params)* is the recommended approach.
+
+It takes the best insight from Cognitect's aws-api — that the service descriptor
+should determine the HTTP verb, not the user — and adapts it to Emacs Lisp
+conventions by using flat keyword arguments (idiomatic in Emacs) rather than
+nested maps (idiomatic in Clojure).
+
+The resulting API surface for a user is:
+
+| Function         | Purpose                                    |
+|------------------+--------------------------------------------|
+| =gdisco-auth=     | Authenticate with Google (returns token)   |
+| =gdisco-client=   | Create an API client (fetches Discovery)   |
+| =gdisco-invoke=   | Call any operation on any Google API        |
+| =gdisco-ops=      | List available operations                  |
+| =gdisco-doc=      | Describe an operation's parameters         |
+
+Five functions. That's the entire public API. Everything else is internal.
+
+** Implementation Notes for Design D
+
+*** The =gdisco-client= object
+
+Internally a plist or alist containing:
+#+BEGIN_SRC emacs-lisp
+'(:api-name "gmail"
+  :version "v1"
+  :token <oauth2-token-object>
+  :spec <parsed-discovery-json>
+  :base-url "https://gmail.googleapis.com/")
+#+END_SRC
+
+*** How =gdisco-invoke= resolves the HTTP method
+
+#+BEGIN_SRC emacs-lisp
+(defun gdisco-invoke (client operation &rest params)
+  "Invoke OPERATION on CLIENT with PARAMS."
+  (let* ((spec (plist-get client :spec))
+         (method-node (gdisco--resolve-method operation spec))
+         (http-verb (alist-get 'httpMethod method-node))  ; "GET", "POST", etc.
+         (param-spec (alist-get 'parameters method-node))
+         ;; Separate gdisco-* control params from API params
+         (control-params (gdisco--extract-control-params params))
+         (api-params (gdisco--extract-api-params params))
+         ;; Build request
+         (url (gdisco--build-url client operation api-params param-spec))
+         (body (plist-get api-params :body))
+         (callback (plist-get control-params :then)))
+    ;; Dispatch sync vs async based on :then
+    (if callback
+        (gdisco--request-async http-verb url body
+                               (plist-get client :token)
+                               callback
+                               (plist-get control-params :else))
+      (gdisco--request-sync http-verb url body
+                            (plist-get client :token)))))
+#+END_SRC
+
+*** Namespace collision avoidance
+
+API parameters come from Google's Discovery spec (e.g. =:userId=, =:format=,
+=:pageSize=). Library control parameters use the =:gdisco-= prefix:
+
+- =:gdisco-pages= — pagination control
+- =:gdisco-signal= — signal conditions on error
+- =:then= / =:else= — async callbacks (short enough to be unambiguous)
+- =:body= — request body (no Google API uses "body" as a parameter name)
+
+** Key Design Decisions to Agree Before Implementation
+
+These are the open questions whose answers lock in the binding shape.
+
+*** 1. Error model: errors-as-data vs condition signals
+
+The aws-api returns anomaly maps. plz.el signals structured conditions.
+Emacs users expect =condition-case=. The recommendation is:
+
+- *Sync calls:* return error alists by default (aws-api style), signal
+  =gdisco-api-error= when =:gdisco-signal t= is passed
+- *Async calls:* route errors to =:else= callback (plz.el style)
+- *Predicate:* =(gdisco-error-p result)= tests any return value
+- *Accessors:* =(gdisco-error-code result)=, =(gdisco-error-message result)=
+
+The error alist mirrors Google's standard error response:
+#+BEGIN_SRC emacs-lisp
+'((gdisco-error . t)
+  (code . 404)
+  (message . "Requested entity was not found.")
+  (status . "NOT_FOUND")
+  (errors . [((message . "...") (domain . "global") (reason . "notFound"))]))
+#+END_SRC
+
+*Alternative:* always signal conditions (like plz.el). Simpler, more Emacsy,
+but makes functional composition harder (every caller needs =condition-case=).
+
+*** 2. Sync-first vs async-first
+
+Following plz.el's lead: *sync by default, async opt-in via =:then=*.
+
+This is critical for REPL/scratch-buffer exploration — the most common
+early use case. =(gdisco-invoke gmail "users.messages.list" :userId "me")=
+should just return data, not require a callback.
+
+Async becomes essential for interactive commands (Phase 1+) and will use
+the same =:then= / =:else= pattern as plz.el.
+
+*** 3. Client object representation
+
+Options:
+- *Plist:* ='(:api-name "gmail" :version "v1" :token ... :spec ...)=
+  Simple, transparent, but no type safety.
+- *cl-defstruct:* =(cl-defstruct gdisco-client api-name version token spec base-url)=
+  Type-safe, has =gdisco-client-p= predicate, but heavier.
+- *Opaque symbol with properties:* Store state in symbol properties.
+  Unusual, not recommended.
+
+Recommendation: =cl-defstruct=. It's lightweight, gives you a predicate for
+free, and accessors are explicit. The client is the one object users hold
+onto — it should be identifiable.
+
+#+BEGIN_SRC emacs-lisp
+(cl-defstruct gdisco-client
+  api-name version token spec base-url)
+
+;; Usage:
+(gdisco-client-p gmail)           ; → t
+(gdisco-client-api-name gmail)    ; → "gmail"
+#+END_SRC
+
+*** 4. Discovery spec caching
+
+Options:
+- *In-memory hash table:* Cache per (api-name . version) key. Lost on restart.
+- *File-based:* Serialize to =~/.emacs.d/gdisco/cache/gmail-v1.json=.
+  Survives restarts. TTL-based invalidation (specs change ~monthly).
+- *Both:* Memory cache with file-based fallback.
+
+Recommendation: Both. File cache with 7-day TTL, memory cache per session.
+=gdisco-client= checks memory → file → network, in that order.
+
+*** 5. HTTP transport layer
+
+Options:
+- *url.el (built-in):* No external deps. Sync via =url-retrieve-synchronously=,
+  async via =url-retrieve=. What the project currently uses.
+- *plz.el:* Modern, clean, sync-by-default. Requires curl. Would need to be
+  a dependency.
+- *request.el:* Widely used, backend-flexible. Async-first design clashes
+  with our sync-first preference.
+
+Recommendation: Start with =url.el= (zero deps, already in use). Abstract
+the transport behind =gdisco--request-sync= / =gdisco--request-async= so
+plz.el can be swapped in later as an optional backend.
+
+*** 6. Auth-source integration
+
+ghub.el's per-package =auth-source= integration is the gold standard for
+Emacs credential management. For Google OAuth2, the flow is different
+(browser-based consent + refresh tokens), but the storage should still
+use =auth-source= or =plstore= (encrypted).
+
+Recommendation: =gdisco-auth= wraps =oauth2-auth-and-store= (already a
+dependency) but provides a higher-level interface that reads client
+credentials from =auth-source= by default. Tokens persist across sessions
+via =oauth2.el='s built-in plstore mechanism.
+
+*** 7. What =gdisco-doc= returns and displays
+
+Two modes:
+- *Programmatic:* return an alist (for code that inspects parameters)
+- *Interactive:* display a formatted help buffer (for humans at the REPL)
+
+Recommendation: When called interactively (=M-x gdisco-doc=), pop a
+=*gdisco-doc*= buffer with formatted output. When called from code,
+return the raw alist. Use =(called-interactively-p 'any)= to distinguish.
+
+#+BEGIN_SRC emacs-lisp
+;; Programmatic:
+(gdisco-doc gmail "users.messages.get")
+;; → alist with parameters, description, httpMethod
+
+;; Interactive (M-x or in scratch buffer with C-j):
+;; Pops a nicely formatted buffer showing:
+;;
+;;   users.messages.get                                    [GET]
+;;   Gets the specified message.
+;;
+;;   REQUIRED:
+;;     userId  string  "The user's email address."
+;;     id      string  "The ID of the message to retrieve."
+;;
+;;   OPTIONAL:
+;;     format  string  enum: full, metadata, minimal, raw
+;;     metadataHeaders  string (repeated)
+#+END_SRC
+
+** Testing Strategy
+
+*** Framework: ERT (Emacs Lisp Regression Testing)
+
+ERT is built into Emacs (since 24.1), requires no external dependencies,
+and is the standard for Emacs Lisp packages. Tests live in =test/= and
+run with =emacs --batch=.
+
+#+BEGIN_SRC emacs-lisp
+(require 'ert)
+(require 'gdisco)
+
+(ert-deftest gdisco-test-path-to-method-node ()
+  "Dotted method name resolves to correct spec path."
+  (should (equal (gdisco-get-path-to-method-node "users.messages.get")
+                 '(resources users resources messages methods get))))
+
+(ert-deftest gdisco-test-error-predicate ()
+  "gdisco-error-p correctly identifies error responses."
+  (should (gdisco-error-p '((gdisco-error . t) (code . 404))))
+  (should-not (gdisco-error-p '((messages . [])))))
+#+END_SRC
+
+Why ERT and not Buttercup (BDD-style) or ecukes (Cucumber-style):
+- Zero dependencies — ERT ships with Emacs
+- =should= / =should-not= / =should-error= cover all assertion needs
+- Emacs package reviewers (MELPA, GNU ELPA) expect ERT
+- Buttercup adds ceremony (=describe= / =it= / =expect=) without
+  material benefit for a library this size
+
+*** Unit tests — what to cover
+
+The internal functions that transform data are highly testable without
+any network access:
+
+| Function                            | What to test                                              |
+|-------------------------------------+-----------------------------------------------------------|
+| =gdisco-get-path-to-method-node=   | Dotted name → spec path conversion                        |
+| =gdisco--resolve-method=           | Operation name → method node lookup in a fixture spec     |
+| =gdisco--build-url=                | Path template interpolation + query string assembly       |
+| =gdisco--extract-control-params=   | Separates =:gdisco-*= / =:then= / =:else= from API args |
+| =gdisco--extract-api-params=       | Returns only API-bound keyword args                       |
+| =gdisco-get-query-string=          | Correct encoding of scalar, list, and repeated params     |
+| =gdisco-get-parametrized-method-path= | Path template with substitution                       |
+| =gdisco-error-p=                   | Predicate on success vs error alists                      |
+| =gdisco-error-code= / =gdisco-error-message= | Accessor correctness                          |
+| =gdisco-ops=                       | Returns sorted list of operation names from fixture spec  |
+| =gdisco-doc= (programmatic)        | Returns correct alist for a method in the fixture spec    |
+
+*** Test fixtures — frozen Discovery specs
+
+Real Discovery JSON responses, saved as files, provide the spec data
+for unit tests. No network calls needed.
+
+#+BEGIN_EXAMPLE
+test/
+  gdisco-test.el                 ; unit tests
+  fixtures/
+    gmail-v1-discovery.json      ; frozen Gmail Discovery response
+    drive-v3-discovery.json      ; frozen Drive Discovery response
+    error-404.json               ; sample Google error response
+    error-403.json               ; sample rate-limit error response
+#+END_EXAMPLE
+
+Fixture creation (one-time):
+#+BEGIN_SRC shell
+curl -s 'https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest' \
+  | python3 -m json.tool > test/fixtures/gmail-v1-discovery.json
+#+END_SRC
+
+Tests load fixtures with:
+#+BEGIN_SRC emacs-lisp
+(defun gdisco-test--load-fixture (name)
+  "Load JSON fixture NAME from test/fixtures/."
+  (let ((path (expand-file-name (concat "fixtures/" name)
+                                (file-name-directory (symbol-file 'gdisco-test--load-fixture)))))
+    (json-read-file path)))
+
+(defvar gdisco-test--gmail-spec
+  (gdisco-test--load-fixture "gmail-v1-discovery.json"))
+#+END_SRC
+
+*** Integration tests — mocking the HTTP layer
+
+Integration tests exercise =gdisco-invoke= end-to-end but mock the
+network transport. Because Design D abstracts HTTP behind
+=gdisco--request-sync= / =gdisco--request-async=, tests can replace
+these with deterministic stubs.
+
+#+BEGIN_SRC emacs-lisp
+(ert-deftest gdisco-test-invoke-list-messages ()
+  "gdisco-invoke returns parsed JSON for a successful list call."
+  (cl-letf (((symbol-function 'gdisco--request-sync)
+             (lambda (_verb _url _body _token)
+               '((messages . [((id . "abc123"))]) (resultSizeEstimate . 1)))))
+    (let* ((client (gdisco-test--make-fake-client))
+           (result (gdisco-invoke client "users.messages.list" :userId "me")))
+      (should (assq 'messages result))
+      (should (= 1 (alist-get 'resultSizeEstimate result))))))
+
+(ert-deftest gdisco-test-invoke-returns-error-alist-on-404 ()
+  "gdisco-invoke returns an error alist (not a signal) on HTTP 404."
+  (cl-letf (((symbol-function 'gdisco--request-sync)
+             (lambda (_verb _url _body _token)
+               '((gdisco-error . t) (code . 404)
+                 (message . "Not found") (status . "NOT_FOUND")))))
+    (let* ((client (gdisco-test--make-fake-client))
+           (result (gdisco-invoke client "users.messages.get"
+                                  :userId "me" :id "bogus")))
+      (should (gdisco-error-p result))
+      (should (= 404 (gdisco-error-code result))))))
+#+END_SRC
+
+=cl-letf= temporarily rebinds function slots — this is the standard
+Emacs Lisp approach for mocking (no mocking library needed).
+
+*** Live integration tests (optional, manual)
+
+For developer use only — not run in CI. Guarded by an environment variable
+so they are skipped by default.
+
+#+BEGIN_SRC emacs-lisp
+(ert-deftest gdisco-test-live-list-messages ()
+  :tags '(:live)
+  (skip-unless (getenv "GDISCO_LIVE_TESTS"))
+  (let* ((token (gdisco-auth ...))
+         (client (gdisco-client "gmail" "v1" :token token))
+         (result (gdisco-invoke client "users.messages.list" :userId "me")))
+    (should (assq 'messages result))))
+#+END_SRC
+
+Run with: =GDISCO_LIVE_TESTS=1 emacs --batch -l test/gdisco-test.el -f ert-run-tests-batch-and-exit=
+
+*** Running tests
+
+#+BEGIN_SRC shell
+# All unit + mock-integration tests
+emacs -Q --batch -L . -l test/gdisco-test.el -f ert-run-tests-batch-and-exit
+
+# Only tests matching a pattern
+emacs -Q --batch -L . -l test/gdisco-test.el \
+  --eval '(ert-run-tests-batch-and-exit "gdisco-test-invoke")'
+
+# Live tests (requires credentials)
+GDISCO_LIVE_TESTS=1 emacs -Q --batch -L . -l test/gdisco-test.el \
+  -f ert-run-tests-batch-and-exit
+#+END_SRC
+
+A =Makefile= target wraps this:
+#+BEGIN_SRC makefile
+EMACS ?= emacs
+
+.PHONY: test
+test:
+	$(EMACS) -Q --batch -L . -l test/gdisco-test.el \
+	  -f ert-run-tests-batch-and-exit
+
+.PHONY: test-live
+test-live:
+	GDISCO_LIVE_TESTS=1 $(EMACS) -Q --batch -L . -l test/gdisco-test.el \
+	  -f ert-run-tests-batch-and-exit
+#+END_SRC
+
+*** Summary
+
+| Layer               | Mechanism                    | Network? | When to run          |
+|---------------------+------------------------------+----------+----------------------|
+| Unit tests          | ERT + fixture JSON files     | No       | Every change         |
+| Integration tests   | ERT + =cl-letf= HTTP mocking | No       | Every change         |
+| Live tests          | ERT + real credentials       | Yes      | Manual / pre-release |
+
+** Phased Implementation Plan (revised for Design D)
+
+*** Phase 0: Core Plumbing
+- =cl-defstruct gdisco-client=
+- =gdisco-client= constructor (fetch + cache Discovery spec)
+- =gdisco--request-sync= / =gdisco--request-async= transport abstraction
+- =gdisco--resolve-method= (operation name → method node in spec)
+- =gdisco--build-url= (parameter injection into path template + query string)
+- =gdisco--extract-control-params= / =gdisco--extract-api-params=
+- Refactor existing =gdisco-do-get= internals into the new structure
+- File-based Discovery spec cache
+
+*** Phase 1: The Five Public Functions
+- =gdisco-auth= — high-level OAuth wrapper
+- =gdisco-client= — public constructor
+- =gdisco-invoke= — the core function (GET only at first, then all verbs)
+- =gdisco-ops= — enumerate operations from the spec
+- =gdisco-doc= — describe operations (programmatic + interactive)
+- Error model: =gdisco-error-p=, =gdisco-error-code=, =gdisco-error-message=
+
+*** Phase 2: Full HTTP Verb Support
+- Extend =gdisco-invoke= to handle POST/PUT/PATCH/DELETE
+- JSON request body encoding
+- =:body= parameter handling
+- =Content-Type= header management
+
+*** Phase 3: Robustness
+- Parameter validation against spec (required fields, types, enums)
+- Auto-pagination via =:gdisco-pages=
+- =:gdisco-signal= condition signalling mode
+- Async support via =:then= / =:else=
+
+*** Phase 4: Domain Integrations
+- =gdisco-drive.el= — file browsing / download
+- =gdisco-gmail.el= — inbox / message reading
+- =gdisco-sheets.el= — org-table ↔ sheet sync
