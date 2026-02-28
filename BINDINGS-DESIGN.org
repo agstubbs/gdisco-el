@@ -604,6 +604,177 @@ return the raw alist. Use =(called-interactively-p 'any)= to distinguish.
 ;;     metadataHeaders  string (repeated)
 #+END_SRC
 
+** Testing Strategy
+
+*** Framework: ERT (Emacs Lisp Regression Testing)
+
+ERT is built into Emacs (since 24.1), requires no external dependencies,
+and is the standard for Emacs Lisp packages. Tests live in =test/= and
+run with =emacs --batch=.
+
+#+BEGIN_SRC emacs-lisp
+(require 'ert)
+(require 'gdisco)
+
+(ert-deftest gdisco-test-path-to-method-node ()
+  "Dotted method name resolves to correct spec path."
+  (should (equal (gdisco-get-path-to-method-node "users.messages.get")
+                 '(resources users resources messages methods get))))
+
+(ert-deftest gdisco-test-error-predicate ()
+  "gdisco-error-p correctly identifies error responses."
+  (should (gdisco-error-p '((gdisco-error . t) (code . 404))))
+  (should-not (gdisco-error-p '((messages . [])))))
+#+END_SRC
+
+Why ERT and not Buttercup (BDD-style) or ecukes (Cucumber-style):
+- Zero dependencies — ERT ships with Emacs
+- =should= / =should-not= / =should-error= cover all assertion needs
+- Emacs package reviewers (MELPA, GNU ELPA) expect ERT
+- Buttercup adds ceremony (=describe= / =it= / =expect=) without
+  material benefit for a library this size
+
+*** Unit tests — what to cover
+
+The internal functions that transform data are highly testable without
+any network access:
+
+| Function                            | What to test                                              |
+|-------------------------------------+-----------------------------------------------------------|
+| =gdisco-get-path-to-method-node=   | Dotted name → spec path conversion                        |
+| =gdisco--resolve-method=           | Operation name → method node lookup in a fixture spec     |
+| =gdisco--build-url=                | Path template interpolation + query string assembly       |
+| =gdisco--extract-control-params=   | Separates =:gdisco-*= / =:then= / =:else= from API args |
+| =gdisco--extract-api-params=       | Returns only API-bound keyword args                       |
+| =gdisco-get-query-string=          | Correct encoding of scalar, list, and repeated params     |
+| =gdisco-get-parametrized-method-path= | Path template with substitution                       |
+| =gdisco-error-p=                   | Predicate on success vs error alists                      |
+| =gdisco-error-code= / =gdisco-error-message= | Accessor correctness                          |
+| =gdisco-ops=                       | Returns sorted list of operation names from fixture spec  |
+| =gdisco-doc= (programmatic)        | Returns correct alist for a method in the fixture spec    |
+
+*** Test fixtures — frozen Discovery specs
+
+Real Discovery JSON responses, saved as files, provide the spec data
+for unit tests. No network calls needed.
+
+#+BEGIN_EXAMPLE
+test/
+  gdisco-test.el                 ; unit tests
+  fixtures/
+    gmail-v1-discovery.json      ; frozen Gmail Discovery response
+    drive-v3-discovery.json      ; frozen Drive Discovery response
+    error-404.json               ; sample Google error response
+    error-403.json               ; sample rate-limit error response
+#+END_EXAMPLE
+
+Fixture creation (one-time):
+#+BEGIN_SRC shell
+curl -s 'https://www.googleapis.com/discovery/v1/apis/gmail/v1/rest' \
+  | python3 -m json.tool > test/fixtures/gmail-v1-discovery.json
+#+END_SRC
+
+Tests load fixtures with:
+#+BEGIN_SRC emacs-lisp
+(defun gdisco-test--load-fixture (name)
+  "Load JSON fixture NAME from test/fixtures/."
+  (let ((path (expand-file-name (concat "fixtures/" name)
+                                (file-name-directory (symbol-file 'gdisco-test--load-fixture)))))
+    (json-read-file path)))
+
+(defvar gdisco-test--gmail-spec
+  (gdisco-test--load-fixture "gmail-v1-discovery.json"))
+#+END_SRC
+
+*** Integration tests — mocking the HTTP layer
+
+Integration tests exercise =gdisco-invoke= end-to-end but mock the
+network transport. Because Design D abstracts HTTP behind
+=gdisco--request-sync= / =gdisco--request-async=, tests can replace
+these with deterministic stubs.
+
+#+BEGIN_SRC emacs-lisp
+(ert-deftest gdisco-test-invoke-list-messages ()
+  "gdisco-invoke returns parsed JSON for a successful list call."
+  (cl-letf (((symbol-function 'gdisco--request-sync)
+             (lambda (_verb _url _body _token)
+               '((messages . [((id . "abc123"))]) (resultSizeEstimate . 1)))))
+    (let* ((client (gdisco-test--make-fake-client))
+           (result (gdisco-invoke client "users.messages.list" :userId "me")))
+      (should (assq 'messages result))
+      (should (= 1 (alist-get 'resultSizeEstimate result))))))
+
+(ert-deftest gdisco-test-invoke-returns-error-alist-on-404 ()
+  "gdisco-invoke returns an error alist (not a signal) on HTTP 404."
+  (cl-letf (((symbol-function 'gdisco--request-sync)
+             (lambda (_verb _url _body _token)
+               '((gdisco-error . t) (code . 404)
+                 (message . "Not found") (status . "NOT_FOUND")))))
+    (let* ((client (gdisco-test--make-fake-client))
+           (result (gdisco-invoke client "users.messages.get"
+                                  :userId "me" :id "bogus")))
+      (should (gdisco-error-p result))
+      (should (= 404 (gdisco-error-code result))))))
+#+END_SRC
+
+=cl-letf= temporarily rebinds function slots — this is the standard
+Emacs Lisp approach for mocking (no mocking library needed).
+
+*** Live integration tests (optional, manual)
+
+For developer use only — not run in CI. Guarded by an environment variable
+so they are skipped by default.
+
+#+BEGIN_SRC emacs-lisp
+(ert-deftest gdisco-test-live-list-messages ()
+  :tags '(:live)
+  (skip-unless (getenv "GDISCO_LIVE_TESTS"))
+  (let* ((token (gdisco-auth ...))
+         (client (gdisco-client "gmail" "v1" :token token))
+         (result (gdisco-invoke client "users.messages.list" :userId "me")))
+    (should (assq 'messages result))))
+#+END_SRC
+
+Run with: =GDISCO_LIVE_TESTS=1 emacs --batch -l test/gdisco-test.el -f ert-run-tests-batch-and-exit=
+
+*** Running tests
+
+#+BEGIN_SRC shell
+# All unit + mock-integration tests
+emacs -Q --batch -L . -l test/gdisco-test.el -f ert-run-tests-batch-and-exit
+
+# Only tests matching a pattern
+emacs -Q --batch -L . -l test/gdisco-test.el \
+  --eval '(ert-run-tests-batch-and-exit "gdisco-test-invoke")'
+
+# Live tests (requires credentials)
+GDISCO_LIVE_TESTS=1 emacs -Q --batch -L . -l test/gdisco-test.el \
+  -f ert-run-tests-batch-and-exit
+#+END_SRC
+
+A =Makefile= target wraps this:
+#+BEGIN_SRC makefile
+EMACS ?= emacs
+
+.PHONY: test
+test:
+	$(EMACS) -Q --batch -L . -l test/gdisco-test.el \
+	  -f ert-run-tests-batch-and-exit
+
+.PHONY: test-live
+test-live:
+	GDISCO_LIVE_TESTS=1 $(EMACS) -Q --batch -L . -l test/gdisco-test.el \
+	  -f ert-run-tests-batch-and-exit
+#+END_SRC
+
+*** Summary
+
+| Layer               | Mechanism                    | Network? | When to run          |
+|---------------------+------------------------------+----------+----------------------|
+| Unit tests          | ERT + fixture JSON files     | No       | Every change         |
+| Integration tests   | ERT + =cl-letf= HTTP mocking | No       | Every change         |
+| Live tests          | ERT + real credentials       | Yes      | Manual / pre-release |
+
 ** Phased Implementation Plan (revised for Design D)
 
 *** Phase 0: Core Plumbing
